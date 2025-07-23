@@ -43,6 +43,7 @@ source("code/functions_data_v6.R")
 source("code/functions_forecasting_v6.R")
 source("code/functions_conditions_v6.R")
 source("code/functions_output_v6.R")
+source("code/functions_irf_v6.R")
 
 #-----------------------------------
 # 1. load/transform data from fred
@@ -479,6 +480,27 @@ p_one_var <- make_fanchart_one_var_export(
 )
 print(p_one_var)
 ggsave("gdp_fcst_cond_fed_gdp.pdf", p_one_var, width = 8, height = 5)
+
+
+#-----------------------------------
+# 8. structural impulse response example
+#-----------------------------------
+# compute an IRF to a Fed Funds Rate shock and plot responses
+
+irf_ffr <- generate_irf(
+  res       = res,
+  p         = p,
+  horizon   = 12,
+  shock_var = "Fed Funds Rate"
+)
+
+p_irf_ffr <- plot_irf_core(
+  irf_array  = irf_ffr,
+  var_names0 = var_names0,
+  shock_name = "Fed Funds Rate"
+)
+print(p_irf_ffr)
+ggsave("irf_fedfunds.png", p_irf_ffr, width = 10, height = 6)
 
 
 
