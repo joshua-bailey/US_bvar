@@ -1,374 +1,257 @@
-########################
-## functions_forecasting_v6.R
-########################
+###############################################################################
+## functions_forecasting_v6.R – Simulation, filtering & output utilities    ##
+###############################################################################
+## Roles of this file
+##   • Convert BVAR draws to a state-space form
+##   • Run Kalman filter / Carter-Kohn smoother draw-by-draw
+##   • Produce unconditional and conditional forecast arrays
+##   • Re-attach forecasts to historical data in raw units
+###############################################################################
 
-#-----------------------------------
-# 1. building a state-space form from bvar coefficients
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 1.  State-space representation
+# ---------------------------------------------------------------------------
+#  Given BVAR coefficients (β) and residual covariance (Σ), build the
+#  companion-form matrices
+#        y_t = G x_t + v_t,   v_t ~ N(0,R)
+#        x_t = F x_{t-1} + u_t, u_t ~ N(0,Q)
+#
 state_space <- function(B, Sig, p) {
-  # we want f, q, g, r in a companion form:
-  #   y_t = g * x_t + v_t,  v_t ~ n(0, r)
-  #   x_t = f * x_{t-1} + u_t,  u_t ~ n(0, q)
-  #
-  # b is (p+1) x n, with b[1,] as intercept
-  # sig is n x n
-  # f is (n*(p+1)) x (n*(p+1))
-  #
-  # we place the top block of f with the lag coefficients,
-  # and the bottom block is mostly identity to move states forward.
   
-  n   <- dim(B)[2]        # number of variables
-  np1 <- n * (p + 1)      # companion state dimension
+  n   <- dim(B)[2]          # number of observed variables
+  np1 <- n * (p + 1)        # dimension of companion state
   np  <- n * p
   
-  # r = 0 since measurement eq is y_t = x_t[1:n] + 0
-  R <- matrix(0, n, n)
+  R <- matrix(0, n, n)      # no additional measurement noise
+  G <- matrix(0, n, np1); G[, 1:n] <- diag(n)
   
-  # g picks off the first n elements of x_t to interpret as y_t
-  G <- matrix(0, n, np1)
-  G[, 1:n] <- diag(n)
-  
-  # q is (np1 x np1), with sig in the top-left
   Q <- matrix(0, np1, np1)
-  Q[1:n, 1:n] <- Sig
+  Q[1:n, 1:n] <- Sig        # process noise only enters first n eqns
   
-  # build f
   F <- matrix(0, np1, np1)
-  # b[2:(np+1), ] is the stacked lag coefficients
-  F[1:n, 1:np] <- t(B[2:(np + 1), ])
-  # identity to move intercept forward
-  F[1:n, (np + 1):np1] <- diag(n)
-  # if p>1, shift older lags
-  if (p > 1) {
-    F[(n + 1):np, 1:(n * (p - 1))] <- diag(n * (p - 1))
-  }
-  # the last n just carry forward
-  F[(np + 1):np1, (np + 1):np1] <- diag(n)
+  F[1:n, 1:np] <- t(B[2:(np + 1), ])         # lag coefficients
+  F[1:n, (np + 1):np1] <- diag(n)            # intercept as state
+  if (p > 1)
+    F[(n + 1):np, 1:(n * (p - 1))] <- diag(n * (p - 1))  # shift lags
+  F[(np + 1):np1, (np + 1):np1] <- diag(n)               # keep intercept
   
-  return(list(F = F, Q = Q, G = G, R = R))
+  list(F = F, Q = Q, G = G, R = R)
 }
 
-#-----------------------------------
-# 2. kalman filter for forecast extension
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 2.  Kalman filter – forward pass over history + forecast horizon
+# ---------------------------------------------------------------------------
 kalman <- function(F, Q, G, Y, c_init, p, h) {
-  # we do a forward pass to get x_{t|t} for t = T+1 ... T+h
-  # c_init is the intercept row (b[1, ])
-  # p is number of lags
-  # y is dimension (t x n); we add rows of na for future quarters
-  #
-  # returns:
-  #   xtt -> the sequence of filtered states for t=1..h
-  #   vtt -> the sequence of var-cov for each t
   
-  T <- nrow(Y)   # total time steps in y
-  n <- nrow(G)
-  m <- nrow(F)   # dimension of x_t
+  T <- nrow(Y)                       # total obs incl. NA forecast rows
+  n <- nrow(G);  m <- nrow(F)
   
-  # we build the initial state x00 from the last p obs plus intercept
-  # for the new forecast steps
+  # Build initial state: last p observations plus intercept
   x00 <- matrix(0, m, 1)
-  for (i in 1:p) {
-    # fill in the older obs in reverse
+  for (i in 1:p)
     x00[(1 + n * (i - 1)):(n * i)] <- Y[T - h - i + 1, ]
-  }
-  # place the intercept in the last n elements
   x00[(m - n + 1):m] <- c_init
   
-  # build initial variance
-  V00 <- matrix(0, m, m)
-  # set the intercept part to identity
-  V00[1:n, 1:n] <- diag(n)
+  V00 <- matrix(0, m, m); V00[1:n, 1:n] <- diag(n)   # diffuse prior
   
-  # placeholders
-  xtt <- c()       # will store x_{t|t} for t=1..h
-  Vtt <- list()
+  xtt <- NULL; Vtt <- list()
   
   for (t in 0:h) {
-    # one-step predict
+    
+    ## 2.1  One-step prediction
     x01 <- F %*% x00
     V01 <- F %*% V00 %*% t(F) + Q
     
-    # next we update with Y at time T-h+t
-    # note that T-h is the last historical point minus the forecast horizon
-    # so T-h+t moves from T-h up to T
+    ## 2.2  Conditioning on observed y_t (if any)
     yt  <- Y[T - h + t, ]
     ind <- which(!is.na(yt))
-    
-    if (length(ind) == 0) {
-      # means all y are na, so no update
-      # store predicted state
-      if (t >= 1) {
-        xtt <- rbind(xtt, t(x01))
-        Vtt[[t]] <- V01
-      }
-      x00 <- x01
-      V00 <- V01
-      next
-    } else {
-      # measurement update
-      Gt <- G[ind, ]  # partial pick if some subset is non-na
-      if (length(ind) == 1) {
-        Gt <- matrix(G[ind, ], nrow = 1)
-      }
+    if (length(ind) > 0) {
       
+      Gt <- if (length(ind) == 1) matrix(G[ind, ], 1) else G[ind, ]
       Vy <- Gt %*% V01 %*% t(Gt)
       K  <- V01 %*% t(Gt) %*% solve(Vy)
+      
       x00 <- x01 + K %*% (yt[ind] - Gt %*% x01)
       V00 <- V01 - K %*% Gt %*% V01
-      
-      # store after update
-      if (t >= 1) {
-        xtt <- rbind(xtt, t(x00))
-        Vtt[[t]] <- V00
-      }
+    } else {                      # no measurement update
+      x00 <- x01;  V00 <- V01
+    }
+    
+    if (t >= 1) {
+      xtt <- rbind(xtt, t(x00))
+      Vtt[[t]] <- V00
     }
   }
   
-  return(list(xtt = xtt, Vtt = Vtt))
+  list(xtt = xtt, Vtt = Vtt)
 }
 
-#-----------------------------------
-# 3. smoother (carter-kohn approach)
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 3.  Carter–Kohn smoother – single draw of x_{t|T}
+# ---------------------------------------------------------------------------
 smoother <- function(F, Q, xtt, Vtt, Y, h) {
-  # we do a backward pass starting from t = T
-  # T = last row of Y, h steps of forecast
-  # xtt, Vtt are from the kalman filter forward pass
-  #
-  # returns draws of x_{t|T}, but we take just one draw
-  # we keep a median path or single draw as needed
   
-  T <- nrow(Y)
-  n <- ncol(Y)
-  m <- ncol(xtt)
-  xtT <- c()
+  T <- nrow(Y);  n <- ncol(Y);  m <- ncol(xtt)
+  xtT <- NULL                       # will accumulate backwards
   
-  # final period
-  yt    <- Y[T, ]
-  ind   <- which(!is.na(yt))
-  ind_na<- which(is.na(yt))
-  k     <- length(ind_na)
+  ## 3.1  Draw final-period state -------------------------------------------
+  yt      <- Y[T, ]
+  ind_obs <- which(!is.na(yt)); ind_mis <- which(is.na(yt))
+  k       <- length(ind_mis)
   
-  # step 1: draw x_{T|T}
-  m0 <- matrix(xtt[h, ind_na], k, 1)
-  V0 <- Vtt[[h]][ind_na, ind_na]
-  # random draw from n(m0, v0)
-  x_draw0 <- m0 + t(chol(V0)) %*% rnorm(k)
-  x_draw  <- adjust_draw(yt, x_draw0)  # fill in known obs
-  xtT     <- rbind(xtT, t(x_draw))
+  m0 <- matrix(xtt[h, ind_mis], k, 1)
+  V0 <- Vtt[[h]][ind_mis, ind_mis]
+  x_draw <- adjust_draw(yt,
+                        m0 + t(chol(V0)) %*% rnorm(k))   # fill observed vars
+  xtT <- rbind(xtT, t(x_draw))
   
-  # now go backward t=1..(h-1)
+  ## 3.2  Backward recursion -------------------------------------------------
   for (t in 1:(h - 1)) {
-    yt  <- Y[T - t, ]
-    ind <- which(!is.na(yt))
-    ind_na <- which(is.na(yt))
-    k <- length(ind_na)
+    
+    yt       <- Y[T - t, ]
+    ind_obs  <- which(!is.na(yt)); ind_mis <- which(is.na(yt))
+    k        <- length(ind_mis)
     
     if (k == 0) {
-      # no missing, we store actual
-      xtT <- rbind(xtT, t(yt))
-      next
+      xtT <- rbind(xtT, t(yt));  next
     }
     
-    # partial f for these missing vars
-    if (k > 1) {
-      Ft <- F[ind_na, ]
-    } else {
-      Ft <- matrix(F[ind_na, ], nrow = 1)
-    }
+    Ft  <- if (k == 1) matrix(F[ind_mis, ], 1) else F[ind_mis, ]
+    x00 <- matrix(xtt[h - t, ], m, 1);  V00 <- Vtt[[h - t]]
+    x01 <- Ft %*% x00;  V01 <- Ft %*% V00 %*% t(Ft) + Q[ind_mis, ind_mis]
     
-    x00 <- matrix(xtt[h - t, ], m, 1)
-    x01 <- Ft %*% x00
-    V00 <- Vtt[[h - t]]
+    x_temp  <- matrix(x_draw[ind_mis], k, 1)
+    m0 <- x00 + V00 %*% t(Ft) %*% solve(V01) %*% (x_temp - x01)
+    V0 <- V00 - V00 %*% t(Ft) %*% solve(V01) %*% Ft %*% V00
     
-    # q subset
-    qt  <- Q[ind_na, ind_na]
-    V01 <- Ft %*% V00 %*% t(Ft) + qt
-    
-    x_temp <- matrix(x_draw[ind_na], k, 1)
-    m0     <- x00 + V00 %*% t(Ft) %*% solve(V01) %*% (x_temp - x01)
-    V0     <- V00 - V00 %*% t(Ft) %*% solve(V01) %*% Ft %*% V00
-    
-    x_draw0 <- m0[ind_na] + t(chol(V0[ind_na, ind_na])) %*% rnorm(k)
-    x_draw  <- adjust_draw(yt, x_draw0)
-    xtT     <- rbind(xtT, t(x_draw))
+    x_draw <- adjust_draw(yt,
+                          m0[ind_mis] + t(chol(V0[ind_mis, ind_mis])) %*% rnorm(k))
+    xtT <- rbind(xtT, t(x_draw))
   }
   
-  # reverse order so we get x_{T-h+1|T} ... x_{T|T}
-  return(xtT[seq(nrow(xtT), 1, -1), ])
+  xtT[seq(nrow(xtT), 1, -1), ]      # reverse to chronological order
 }
 
-#-----------------------------------
-# 4. helper for smoother draws
-#-----------------------------------
+# Helper – merge simulated draws with observed y_t where available
 adjust_draw <- function(yt, x0) {
-  # we take a draw for the missing variables, but if a var is known (not na),
-  # we fill it in from yt
-  # so we combine them in a single vector
-  ind     <- which(!is.na(yt))
-  ind_na  <- which(is.na(yt))
-  x1      <- matrix(NA, length(yt), 1)
-  x1[ind] <- yt[ind]
-  x1[ind_na] <- x0
-  return(x1)
+  ind_obs <- which(!is.na(yt)); ind_mis <- which(is.na(yt))
+  out <- matrix(NA_real_, length(yt), 1)
+  out[ind_obs] <- yt[ind_obs];  out[ind_mis] <- x0
+  out
 }
 
-#-----------------------------------
-# 5. generate_unconditional forecast
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 4.  Unconditional forecast (all draws)                                     #
+# ---------------------------------------------------------------------------
 generate_unconditional <- function(data, df, res, p, h, n_sim, var_names0) {
-  # this function creates an unconditional forecast by:
-  #   1) building y with future n/a
-  #   2) for each draw, do a forward/backward pass
-  #
-  # returns a 3d array: [h x n_vars x n_sim]
-  #
-  Y       <- rbind(as.matrix(data), matrix(NA, h, ncol(data)))
-  end_ind <- nrow(data)
-  forecasts <- array(0, c(h, ncol(Y), n_sim))
   
-  # we get the intercept from the first row of each draw
-  # and do the full procedure
+  Y        <- rbind(as.matrix(data), matrix(NA, h, ncol(data)))
+  end_ind  <- nrow(data)
+  forecasts<- array(0, c(h, ncol(Y), n_sim))
+  
   pb <- txtProgressBar(min = 1, max = n_sim, style = 3)
   for (i in seq_len(n_sim)) {
-    beta  <- res$beta[i, , ]
-    sigma <- res$sigma[i, , ]
-    c_init<- beta[1, ]  # intercept
-    
-    fcst_i <- generate_forecasts_one_batch(Y, df, beta, sigma, p, h, var_names0, end_ind, c_init)
-    forecasts[,, i] <- fcst_i
+    beta  <- res$beta[i, , ]; sigma <- res$sigma[i, , ]
+    fcst_i<- generate_forecasts_one_batch(
+      Y, df, beta, sigma, p, h, var_names0, end_ind,
+      c_init = beta[1, ])
+    forecasts[ , , i] <- fcst_i
     setTxtProgressBar(pb, i)
   }
   cat("\n")
-  
-  return(forecasts)
+  forecasts
 }
 
-#-----------------------------------
-# 6. generate_one_scenario forecast
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 5.  Scenario forecast (future path partly pinned)                          #
+# ---------------------------------------------------------------------------
 generate_one_scenario <- function(Y, end_ind, df, res, p, h, n_sim, var_names0,
                                   base, scenario_name, verbose = TRUE) {
-  # this function pins or shifts the future in some way
-  # but we let external functions (in functions_conditions_v6.R) do the pinning.
-  # base is the unconditional scenario if scenario_name != 'base'
-  #
-  # returns a 3d array: [h x n_vars x n_sim]
   
   forecasts <- array(0, c(h, ncol(Y), n_sim))
   if (verbose) pb <- txtProgressBar(min = 1, max = n_sim, style = 3)
   
   for (i in seq_len(n_sim)) {
-    beta   <- res$beta[i, , ]
-    sigma  <- res$sigma[i, , ]
-    c_init <- beta[1, ]
+    beta <- res$beta[i, , ]; sigma <- res$sigma[i, , ]
+    base0<- if (scenario_name == "base") 0 else base[ , , i]
     
-    # if scenario is 'base', we set base0 = 0
-    # otherwise base is the unconditional forecast for that draw
-    if (scenario_name == "base") {
-      base0 <- 0
-    } else {
-      base0 <- base[,, i]
-    }
-    
-    fcst_i <- generate_forecasts_one_batch(Y, df, beta, sigma, p, h, var_names0, end_ind, c_init,
-                                           base0 = base0)
-    forecasts[,, i] <- fcst_i
-    
+    forecasts[ , , i] <- generate_forecasts_one_batch(
+      Y, df, beta, sigma, p, h,
+      var_names0, end_ind, c_init = beta[1, ],
+      base0 = base0)
     if (verbose) setTxtProgressBar(pb, i)
   }
   if (verbose) cat("\nfinished scenario:", scenario_name, "\n")
-  
-  return(forecasts)
+  forecasts
 }
 
-# -------------------------------------------------------------------
-#  7. generate_forecasts_one_batch  – draw‑by‑draw Kalman smoother forecast
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 6.  Core workhorse – one Kalman-smoother pass for a single draw            #
+# ---------------------------------------------------------------------------
 generate_forecasts_one_batch <- function(
     Y, df, beta, sigma, p, h,
     var_names0, end_ind, c_init,
-    base0 = 0            # offset path (median of baseline if supplied)
-){
-  # Build state‑space representation
-  ss  <- state_space(beta, sigma, p)
+    base0 = 0) {
   
-  # Forward filter + backward smoother
+  ss  <- state_space(beta, sigma, p)
   km  <- kalman(ss$F, ss$Q, ss$G, Y, c_init, p, h)
   xtT <- smoother(ss$F, ss$Q, km$xtt, km$Vtt, Y, h)
   
-  # Extract the top‑n elements (forecasts for original y_t)
-  forecasts <- xtT      # dimensions: h × n_vars
+  forecasts <- xtT
+  if (!identical(base0, 0))
+    forecasts <- forecasts + base0      # offset for conditional paths
   
-  # Apply base‑path offset if provided (used by scenario functions)
-  if (!identical(base0, 0)) {
-    forecasts <- forecasts + base0
-  }
-  
-  return(forecasts)
+  forecasts                         # (h × n_vars) matrix
 }
 
-
-#-----------------------------------
-# 8. combine_fcst_with_history_raw
-#-----------------------------------
-combine_fcst_with_history_raw <- function(fcst_array, df_transformed, h, trans, var_names, var_names0,
+# ---------------------------------------------------------------------------
+# 7.  Attach forecasts to history in raw units                               #
+# ---------------------------------------------------------------------------
+combine_fcst_with_history_raw <- function(fcst_array,
+                                          df_transformed,
+                                          h, trans,
+                                          var_names, var_names0,
                                           center = c("median", "mean")) {
-  # this function merges the forecast array with the historical df,
-  # reverting the log/100 scaling back to real-world levels.
-  #
-  # fcst_array is [h x n_vars x n_sim]
-  # df_transformed is the historical data in transformed space (e.g. log, raw)
-  # we pick median or mean across the n_sim dimension
-  # then we tack it on to the df (by creating future yq)
   
   center <- match.arg(center)
-  if (center == "median") {
-    fcst_summary <- apply(fcst_array, c(1, 2), median)
-  } else {
-    fcst_summary <- apply(fcst_array, c(1, 2), mean)
-  }
+  fcst_summary <- if (center == "median")
+    apply(fcst_array, c(1, 2), median)
+  else
+    apply(fcst_array, c(1, 2), mean)
   
-  # revert the transforms
+  # --- 7.1  Helper to undo model transforms -------------------------------
   revert_transforms_df <- function(df_in, var_names, var_names0, trans) {
-    df_out <- df_in
+    out <- df_in
     for (j in seq_along(var_names)) {
-      col_j <- var_names[j]
-      if (trans[j] == "log100") {
-        df_out[[col_j]] <- exp(df_out[[col_j]] / 100)
-      } else if (trans[j] == "raw") {
-        df_out[[col_j]] <- df_out[[col_j]] / 100
-      }
-      # potential gdp division by 10
-      if (var_names0[j] == "Potential GDP") {
-        df_out[[col_j]] <- df_out[[col_j]] / 10
-      }
+      v <- var_names[j]
+      if (trans[j] == "log100") out[[v]] <- exp(out[[v]] / 100)
+      if (trans[j] == "raw")    out[[v]] <- out[[v]] / 100
+      if (var_names0[j] == "Potential GDP")
+        out[[v]] <- out[[v]] / 10
     }
-    return(df_out)
+    out
   }
   
-  # revert historical
-  df_history_raw <- revert_transforms_df(df_transformed, var_names, var_names0, trans)
+  # --- 7.2  Back-transform history & forecasts -----------------------------
+  df_hist_raw <- revert_transforms_df(df_transformed, var_names, var_names0, trans)
   
-  # revert forecast summary
-  df_fcst <- as.data.frame(fcst_summary)
-  colnames(df_fcst) <- var_names
+  df_fcst <- as.data.frame(fcst_summary);  names(df_fcst) <- var_names
   df_fcst_raw <- revert_transforms_df(df_fcst, var_names, var_names0, trans)
   
-  # build future yq
-  last_obs <- tail(df_history_raw$yq, 1)
-  future_dates <- seq(as.yearqtr(last_obs) + 0.25, by = 0.25, length.out = h)
+  future_dates <- seq(tail(df_hist_raw$yq, 1) + 0.25,
+                      by   = 0.25, length.out = h)
   df_fcst_raw$yq <- future_dates
   
-  # combine
-  df_combined <- bind_rows(df_history_raw, df_fcst_raw)
-  return(df_combined)
+  bind_rows(df_hist_raw, df_fcst_raw)
 }
 
-#-----------------------------------
-# Unused functions to potentially add back later 
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 8.  Unused functions to potentially add back later                                      #
+# ---------------------------------------------------------------------------
+#  • entropic_tilting_pce()  – importance-sample draws to hit a PCE target
+#  • check_explosive() / check_stability()  – eigenvalue diagnostics
+#    (left untouched; original internal logic retained)
+
 entropic_tilting_pce=function(forecast,var_names0){
   ind=which(var_names0=='PCE Price Index')
   h=12
@@ -412,5 +295,3 @@ check_stability=function(res){
   inds_stable=sapply(1:n_sim,is_stable,res)
   return(inds_stable)
 }
-
-

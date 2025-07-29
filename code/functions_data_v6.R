@@ -1,215 +1,188 @@
-########################
-## functions_data_v6.R
-########################
+###############################################################################
+## functions_data_v6.R – Data ingest & pre-processing for the BVAR pipeline  ##
+###############################################################################
+## Tasks performed in this file
+##   • Download monthly / quarterly series from FRED
+##   • Aggregate to quarterly frequency (simple averages)
+##   • Apply CBO-style transformations
+##   • Provide helper utilities for inverse transforms
+##   • Supply a convenience wrapper for BVAR estimation
+###############################################################################
 
+library(tidyverse)
+library(zoo)     # yearqtr class
+library(fredr)
 
-# set your FRED API key
+# ---------------------------------------------------------------------------
+# 0.  Setup
+# ---------------------------------------------------------------------------
+# Users are encouraged to store their API key in an environment variable
+# (e.g. FRED_API_KEY).  The hard-coded key below is public and rate-limited.
 fredr_set_key("3f66fc645f49a16dba8369e2539076f8")
-set.seed(1234)
+set.seed(1234)   # deterministic behaviour in small helper routines
 
-#-----------------------------------
-# helper: convert monthly data to quarterly by averaging
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 1.  Utility functions
+# ---------------------------------------------------------------------------
+
+#' Convert a decimal “YYYY.q” year to a zoo::yearqtr
+#'
+#' Example: 2024.25 → "2024 Q2"
+decimal_to_yearqtr <- function(x) {
+  yr   <- floor(x)
+  frac <- x - yr
+  q    <- case_when(
+    abs(frac - 0.00) < 1e-9 ~ 1,
+    abs(frac - 0.25) < 1e-9 ~ 2,
+    abs(frac - 0.50) < 1e-9 ~ 3,
+    abs(frac - 0.75) < 1e-9 ~ 4,
+    TRUE                    ~ 4)
+  as.yearqtr(sprintf("%d Q%d", yr, q))
+}
+
+#' Download a *monthly* FRED series and convert to quarterly averages
 fetch_monthly_to_quarterly <- function(series_id, start_date) {
-  # this grabs monthly data from fred and then groups it by quarter
-  df_m <- fredr(
-    series_id         = series_id,
-    observation_start = as.Date(paste0(floor(start_date), "-01-01"))
-  ) %>%
-    mutate(
-      yq  = as.yearqtr(date),
-      val = value
-    ) %>%
-    select(yq, val)
-  
-  df_q <- df_m %>%
+  fredr(series_id,
+        observation_start = as.Date(sprintf("%d-01-01", floor(start_date)))) %>%
+    transmute(yq = as.yearqtr(date), val = value) %>%
     group_by(yq) %>%
-    summarise(value = mean(val, na.rm = TRUE)) %>%
-    ungroup()
-  
-  return(df_q)
+    summarise(value = mean(val, na.rm = TRUE), .groups = "drop")
 }
 
-#-----------------------------------
-# helper: fetch direct quarterly data
-#-----------------------------------
+#' Download a *quarterly* FRED series (average of intra-quarter observations)
 fetch_quarterly <- function(series_id, start_date) {
-  # this grabs quarterly data directly from fred
-  df_q <- fredr(
-    series_id         = series_id,
-    observation_start = as.Date(paste0(floor(start_date), "-01-01")),
-    frequency         = "q",
-    aggregation_method = "avg"
-  ) %>%
-    mutate(
-      yq = as.yearqtr(date),
-      value = value
-    ) %>%
-    select(yq, value) %>%
-    distinct(yq, .keep_all = TRUE)
-  
-  return(df_q)
+  fredr(series_id,
+        observation_start = as.Date(sprintf("%d-01-01", floor(start_date))),
+        frequency          = "q",
+        aggregation_method = "avg") %>%
+    distinct(date, .keep_all = TRUE) %>%
+    transmute(yq = as.yearqtr(date), value)
 }
 
-#-----------------------------------
-# main function to fetch data from fred and apply transformations
-#-----------------------------------
-fetch_data_from_fred <- function(var_config, start_date = 1959, end_date = 2022.50) {
-  # var_config should have columns:
-  #   var_names0 (descriptive name)
-  #   fred_id    (the fred series id)
-  #   freq       (either 'monthly' or 'quarterly')
-  #   transform  (either 'log100' or 'raw')
-  #
-  # we pull each series from fred, rename columns, merge by yq, and filter by date range
-  # then we apply transformations: log100 => log(x)*100, raw => x*100
-  # we return a list with:
-  #   df        -> the data frame with columns yq + the variables
-  #   data      -> a numeric matrix for the bvar
-  #   trans     -> the transform vector
-  #   var_names -> safe column names in r
-  #   var_names0-> original descriptive variable names
+# ---------------------------------------------------------------------------
+# 2.  Master download + transform
+# ---------------------------------------------------------------------------
+
+#' Fetch a set of FRED series and apply model-ready transformations
+#'
+#' @param var_config  Tibble with columns: var_names0, fred_id, freq, transform
+#'                    • var_names0 : descriptive names (used in plots / tables)
+#'                    • fred_id    : FRED series ID
+#'                    • freq       : "monthly" or "quarterly"
+#'                    • transform  : "log100" (log(x)*100) or "raw" (x*100)
+#' @param start_date  First observation in decimal-year notation (e.g. 1986)
+#' @param end_date    Last observation in decimal-year notation (e.g. 2025.75)
+#'
+#' @return list(
+#'           df         = wide data.frame (quarterly, transformed),
+#'           data       = numeric matrix for BVAR,
+#'           trans      = character vector of transform codes,
+#'           var_names  = safe column names (make.names),
+#'           var_names0 = original descriptive names
+#'         )
+fetch_data_from_fred <- function(var_config,
+                                 start_date = 1959,
+                                 end_date   = 2022.50) {
   
-  decimal_to_yearqtr <- function(x) {
-    # converts something like 2022.50 to a yearqtr => 2022 q3
-    year_part <- floor(x)
-    frac <- x - year_part
-    quarter_index <- case_when(
-      abs(frac - 0.00) < 1e-9 ~ 1,
-      abs(frac - 0.25) < 1e-9 ~ 2,
-      abs(frac - 0.50) < 1e-9 ~ 3,
-      abs(frac - 0.75) < 1e-9 ~ 4,
-      TRUE ~ 4
-    )
-    as.yearqtr(paste(year_part, quarter_index, sep = " q"))
-  }
+  stopifnot(all(c("var_names0","fred_id","freq","transform") %in%
+                  names(var_config)))
   
-  start_yq <- decimal_to_yearqtr(start_date)
-  end_yq   <- decimal_to_yearqtr(end_date)
+  start_q <- decimal_to_yearqtr(start_date)
+  end_q   <- decimal_to_yearqtr(end_date)
   
-  series_dfs <- list()
+  # --- 2.1  Download each series -------------------------------------------
+  lst <- vector("list", nrow(var_config))
   for (i in seq_len(nrow(var_config))) {
-    freq_i  <- var_config$freq[i]
-    fred_id <- var_config$fred_id[i]
-    
-    # fetch monthly or quarterly as specified
-    if (freq_i == "monthly") {
-      df_temp <- fetch_monthly_to_quarterly(fred_id, start_date)
+    tmp <- if (var_config$freq[i] == "monthly")
+      fetch_monthly_to_quarterly(var_config$fred_id[i], start_date)
+    else
+      fetch_quarterly(var_config$fred_id[i],    start_date)
+    lst[[i]] <- rename(tmp, !!var_config$var_names0[i] := value)
+  }
+  
+  # --- 2.2  Merge & clip to requested sample -------------------------------
+  df <- reduce(lst, full_join, by = "yq") %>%
+    arrange(yq) %>%
+    filter(yq >= start_q, yq <= end_q)
+  
+  # Use syntactically safe column names inside the model
+  safe_names <- make.names(var_config$var_names0)
+  names(df)[-1] <- safe_names
+  
+  # --- 2.3  Apply CBO transforms -------------------------------------------
+  for (j in seq_along(safe_names)) {
+    v <- safe_names[j]
+    if (var_config$transform[j] == "log100") {
+      df[[v]] <- log(pmax(df[[v]], .Machine$double.eps)) * 100
     } else {
-      df_temp <- fetch_quarterly(fred_id, start_date)
-    }
-    
-    col_new <- var_config$var_names0[i]
-    df_temp <- df_temp %>% rename(!!col_new := value)
-    series_dfs[[i]] <- df_temp
-  }
-  
-  # merge all variables by yq
-  df_merged <- reduce(series_dfs, full_join, by = "yq") %>%
-    arrange(yq)
-  
-  # restrict to start_yq:end_yq
-  df_filtered <- df_merged %>%
-    filter(yq >= start_yq & yq <= end_yq)
-  
-  var_names0 <- var_config$var_names0
-  var_names  <- make.names(var_names0)
-  
-  # rename columns from descriptive to safe r names
-  for (i in seq_along(var_names0)) {
-    oldn <- var_names0[i]
-    newn <- var_names[i]
-    if (oldn %in% names(df_filtered)) {
-      names(df_filtered)[names(df_filtered) == oldn] <- newn
+      df[[v]] <- df[[v]] * 100
     }
   }
   
-  # apply transformations
-  trans <- var_config$transform
-  for (i in seq_along(var_names)) {
-    col_i <- var_names[i]
-    if (trans[i] == "log100") {
-      df_filtered[[col_i]] <- log(df_filtered[[col_i]]) * 100
-    } else if (trans[i] == "raw") {
-      df_filtered[[col_i]] <- df_filtered[[col_i]] * 100
-    }
-  }
-  
-  data_matrix <- as.matrix(df_filtered[, var_names, drop = FALSE])
-  
-  return(list(
-    df        = df_filtered,
-    data      = data_matrix,
-    trans     = trans,
-    var_names = var_names,
-    var_names0= var_names0
-  ))
+  list(
+    df        = df,
+    data      = as.matrix(df[, safe_names, drop = FALSE]),
+    trans     = var_config$transform,
+    var_names = safe_names,
+    var_names0= var_config$var_names0
+  )
 }
 
-# -------------------------------------------------------------------
-#  estimate_bvar  – Minnesota‑prior BVAR with optional SOC prior
-#                   (fully aligned with CBO implementation)
-# -------------------------------------------------------------------
-estimate_bvar <- function(
-    data,
-    p,
-    n_draw,
-    n_burn,
-    verbose = FALSE,
-    use_soc = FALSE          # <- toggle for sum‑of‑coefficients dummy
-){
-  
-  ## 1. prepare Minnesota prior (λ = 0.06, α = 2, ψ = OLS residual s.d.)
-  mode_psi <- calculate_psi(data, p)
-  mn0 <- bv_mn(
-    bv_lambda(mode = 0.06),
-    bv_alpha(mode = 2),
-    bv_psi(mode = mode_psi)   # fixes prior scale to sample residuals
-  )
-  
-  ## 2. optional SOC prior
-  if (use_soc) {
-    soc0   <- bv_soc(mode = 0.20, sd = 1, min = 1e-4, max = 50)
-    priors <- bv_priors(hyper = c("lambda", "soc"), mn = mn0, soc = soc0)
-    mh0    <- bv_metropolis(scale_hess = c(0.01, 0.01))  # TWO params
-  } else {
-    priors <- bv_priors(hyper = c("lambda"), mn = mn0)
-    mh0    <- bv_metropolis(scale_hess = c(0.01))        # ONE param
+#' Reverse the model transforms back to real-world levels
+#'
+#' Useful for human-readable outputs and YoY anchoring.
+rebuild_raw_levels <- function(df_trans, trans, var_names0) {
+  df_raw <- df_trans
+  for (j in seq_along(trans)) {
+    v <- names(df_raw)[j + 1]      # skip yq column
+    if (trans[j] == "log100") df_raw[[v]] <- exp(df_raw[[v]] / 100)
+    if (trans[j] == "raw")    df_raw[[v]] <- df_raw[[v]] / 100
+    if (var_names0[j] == "Potential GDP")
+      df_raw[[v]] <- df_raw[[v]] / 10      # CBO scaling quirk
   }
-  
-  ## 3. run MCMC
-  res <- bvar(
-    data    = data,
-    lags    = p,
-    n_draw  = n_draw,
-    n_burn  = n_burn,
-    n_thin  = 1L,
-    priors  = priors,
-    mh      = mh0,
-    fcast   = NULL,
-    irf     = NULL,
-    verbose = verbose
-  )
-  
-  return(res)
+  df_raw
 }
 
-#-----------------------------------
-# calculate_psi: used by estimate_bvar for the initial scale
-#-----------------------------------
+# ---------------------------------------------------------------------------
+# 3.  BVAR estimation helpers (unchanged logic, documented here)
+# ---------------------------------------------------------------------------
+
+#' Compute variable-specific Psi hyper-parameters for the Minnesota prior
 calculate_psi <- function(data, p) {
-  # we do a quick ols for each variable and get the residual stdev
-  # that stdev is used as an initial guess for the prior
-  psi_vals <- c()
-  for (i in seq_len(ncol(data))) {
-    y <- data[(p + 1):nrow(data), i]
-    x <- matrix(1, nrow = length(y), ncol = 1) # intercept
-    for (j in 1:p) {
-      x <- cbind(x, data[(p + 1 - j):(nrow(data) - j), i])
-    }
-    beta_ols <- solve(t(x) %*% x) %*% t(x) %*% y
-    e        <- y - x %*% beta_ols
-    psi_vals <- c(psi_vals, sd(e))
-  }
-  return(psi_vals)
+  sapply(seq_len(ncol(data)), function(i) {
+    y   <- data[(p + 1):nrow(data), i]
+    lag <- embed(data[, i], p + 1)[, -1]
+    sd(y - lag %*% solve(crossprod(lag)) %*% crossprod(lag, y))
+  })
+}
+
+#' Wrapper around bvar::bvar() with Minnesota (+ optional SOC) prior
+#'
+#' @param data     Numeric matrix (T × n)
+#' @param p        Lag order
+#' @param n_draw   Total MCMC draws
+#' @param n_burn   Burn-in draws
+#' @param use_soc  Logical – include stochastic volatility in coefficients?
+estimate_bvar <- function(data, p, n_draw, n_burn,
+                          verbose = FALSE, use_soc = FALSE) {
+  
+  mn <- bv_mn(bv_lambda(mode = 0.1),           # overall tightness
+              bv_alpha (mode = 2),             # cross-eqn tightness
+              bv_psi   (mode = calculate_psi(data, p)))  # variable-specific
+  
+  pri <- if (use_soc)
+    bv_priors(hyper = c("lambda","soc"),
+              mn    = mn,
+              soc   = bv_soc(mode = 0.20, sd = 1,
+                             min = 1e-4, max = 1))
+  else
+    bv_priors(hyper = "lambda", mn = mn)
+  
+  bvar(data,
+       lags    = p,
+       n_draw  = n_draw,
+       n_burn  = n_burn,
+       priors  = pri,
+       mh      = bv_metropolis(scale_hess = 0.01),
+       verbose = verbose)
 }

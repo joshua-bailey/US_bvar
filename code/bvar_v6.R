@@ -1,506 +1,250 @@
-########################
-## main.R
-########################
-
-# this has soc forecasting 
-# need to do the IRFs inc the conditioning problem
-
-# nb. the shock forecasts seem to work better with some conditioned paths. Maybe more to look into there
-
-# ****************************************************************
-# US macro forecasting and scenarios using a BVAR model
+###############################################################################
+## main.R: download data ▸ estimate BVAR ▸ build scenarios
+###############################################################################
 #
-# this script shows how to use the new bvar pipeline to:
-#   1) load and transform data from fred
-#   2) estimate a bvar
-#   3) generate unconditional forecasts
-#   4) generate conditional/scenario forecasts (e.g. yoy constraints or fixed interest rate)
-#   5) layer shocks on top of an existing baseline
-#   6) produce example multi-scenario plots and single-variable fan charts
+## main.R – Script :                                       ##
+##          • download FRED data                                             ##
+##          • estimate a Minnesota-prior BVAR (optionally SOC-augmented)     ##
+##          • produce unconditional and conditional forecasts                ##
+##          • overlay ex-post “shocks”                                       ##
+##          • generate comparison plots & fan charts                         ##
 #
-#
-# Author: Original BVAR work by Hark Yoo, CBO, updated by Joshua Bailey for FRED data + new conditional forecasting function with shock scenarios
-# ****************************************************************
-library(tidyverse)
-library(readxl)
-library(openxlsx)
-library(zoo)
-library(data.table)
-library(BVAR)
-library(ggplot2)
-library(gridExtra)
-library(RColorBrewer)
-library(fredr)
-library(dplyr)
-library(purrr)
-library(scales)
+#  Author:  Original CBO code (Hark Yoo) – ported / extended for FRED by
+#           Joshua Bailey. 
+###############################################################################
 
-# set seed 
-set.seed(1234)
+## Required helper files (sourced below):
+##   ─ functions_data_v6.R          – data download / transforms
+##   ─ functions_forecasting_v6.R   – state-space wrapper + Kalman smoother
+##   ─ functions_conditions_v6.R    – conditional & shock utilities
+##   ─ functions_output_v6.R        – visualisation / export helpers
+###############################################################################
 
-# source the function files
+## ── 0.  Libraries ──────────────────────────────────────────────────────────
+library(tidyverse)   # data wrangling
+library(readr)       # CSV I/O
+library(zoo)         # yearqtr helper
+library(BVAR)        # posterior sampler
+library(fredr)       # FRED API
+library(ggplot2)     # plotting
+library(scales)      # pretty axes
+
+## ── 1.  Global options ─────────────────────────────────────────────────────
+##   Reproducible RNG seed: honour environment variable if present.
+seed_env <- Sys.getenv("BVAR_SEED")
+set.seed(if (nzchar(seed_env)) as.integer(seed_env) else 1234)
+
+## ── 2.  Source helper scripts ──────────────────────────────────────────────
 source("code/functions_data_v6.R")
 source("code/functions_forecasting_v6.R")
 source("code/functions_conditions_v6.R")
 source("code/functions_output_v6.R")
-source("code/functions_irf_v6.R")
 
-#-----------------------------------
-# 1. load/transform data from fred
-#-----------------------------------
-# define a var_config data frame that describes each variable:
-#   - var_names0 is the descriptive name
-#   - fred_id is the series id in fred
-#   - freq is 'monthly' or 'quarterly'
-#   - transform is 'log100' or 'raw'
-#
-# NIPA Data (Macro variables)
-nipa <- data.frame(
-  var_names0 = c(
-    "GDP", 
-    "Consumption", 
-    "Investment (nonres)", 
-    "Exports", 
-    "Imports", 
-    "GDP Deflator", 
-    "PCE Price Index", 
-    "Core PCE Price Index", 
-    "CPI-U", 
-    "Potential GDP",
-    "Real Govt. Consumption Expenditures & Gross Investment"
-  ),
-  fred_id = c(
-    "GDPC1", 
-    "PCECC96", 
-    "GPDIC1", 
-    "EXPGSC1", 
-    "IMPGSC1", 
-    "GDPDEF", 
-    "PCEPI", 
-    "PCEPILFE", 
-    "CPIAUCSL", 
-    "GDPPOT",
-    "GCEC1"
-  ),
-  freq = rep("quarterly", 11),
-  transform = rep("log100", 11),
-  stringsAsFactors = FALSE
+## ── 3.  Variable configuration (FRED ticker-map) ───────────────────────────
+##   Each tibble row: var_names0 – human-readable label (used for pinning)
+##                    fred_id    – FRED series code
+##                    freq       – "monthly"/"quarterly"
+##                    transform  – "log100" (log-level ×100) or "raw" (×100)
+nipa <- tribble(
+  ~var_names0,                                             ~fred_id,  ~freq,       ~transform,
+  "GDP",                                                   "GDPC1",   "quarterly", "log100",
+  "Consumption",                                           "PCECC96", "quarterly", "log100",
+  "Investment (nonres)",                                   "GPDIC1",  "quarterly", "log100",
+  "Exports",                                               "EXPGSC1", "quarterly", "log100",
+  "Imports",                                               "IMPGSC1", "quarterly", "log100",
+  "GDP Deflator",                                          "GDPDEF",  "quarterly", "log100",
+  "PCE Price Index",                                       "PCEPI",   "quarterly", "log100",
+  "Core PCE Price Index",                                  "PCEPILFE","quarterly", "log100",
+  "CPI-U",                                                 "CPIAUCSL","quarterly", "log100",
+  "Potential GDP",                                         "GDPPOT",  "quarterly", "log100",
+  "Real Govt. Consumption Expenditures & Gross Investment","GCEC1",   "quarterly", "log100"
 )
 
-# Labour Market Variables
-labour <- data.frame(
-  var_names0 = c(
-    "Payroll Employment",
-    "Labor Force",
-    "Wages",
-    "Unemployment Rate"
-  ),
-  fred_id = c(
-    "PAYEMS",
-    "CLF16OV",
-    "A4102C1Q027SBEA",
-    "UNRATE"
-  ),
-  freq = c("monthly", "monthly", "quarterly", "monthly"),
-  transform = c("log100", "log100", "log100", "raw"),
-  stringsAsFactors = FALSE
+labour <- tribble(
+  ~var_names0,         ~fred_id,   ~freq,    ~transform,
+  "Payroll Employment","PAYEMS",   "monthly","log100",
+  "Labor Force",       "CLF16OV",  "monthly","log100",
+  "Wages",             "A4102C1Q027SBEA","quarterly","log100",
+  "Unemployment Rate", "UNRATE",   "monthly","raw"
 )
 
-# Financial Market Variables
-financial <- data.frame(
-  var_names0 = c(
-    "Fed Funds Rate",
-    "TR3m Rate",
-    "TR10y Rate",
-    "TR1y Rate",
-    "Moody's Aaa",
-    "Industrial Production"
-  ),
-  fred_id = c(
-    "FEDFUNDS",
-    "TB3MS",
-    "GS10",
-    "GS1",
-    "AAA",
-    "INDPRO"
-  ),
-  freq = c("monthly", "monthly", "monthly", "monthly", "monthly", "monthly"),
-  transform = c("raw", "raw", "raw", "raw", "raw", "log100"),
-  stringsAsFactors = FALSE
+financial <- tribble(
+  ~var_names0,        ~fred_id, ~freq,    ~transform,
+  "Fed Funds Rate",   "FEDFUNDS","monthly","raw",
+  "TR3m Rate",        "TB3MS",  "monthly","raw",
+  "TR10y Rate",       "GS10",   "monthly","raw",
+  "TR1y Rate",        "GS1",    "monthly","raw",
+  "Moody's Aaa",      "AAA",    "monthly","raw",
+  "Industrial Production","INDPRO","monthly","log100"
 )
 
-# Additional Variables
-additional <- data.frame(
-  var_names0 = c(
-    "Cleveland Fed 10-yr Inflation Expectations",
-    "Economic Policy Uncertainty Index",
-    "WTI Spot Oil Price"
-  ),
-  fred_id = c(
-    "EXPINF10YR",
-    "USEPUINDXM",
-    "MCOILWTICO"
-  ),
-  freq = rep("monthly", 3),
-  transform = c("raw", "log100", "log100"),
-  stringsAsFactors = FALSE
+additional <- tribble(
+  ~var_names0,                               ~fred_id,    ~freq,    ~transform,
+  "Cleveland Fed 10-yr Inflation Expectations","EXPINF10YR","monthly","raw",
+  "Economic Policy Uncertainty Index",        "USEPUINDXM","monthly","log100",
+  "WTI Spot Oil Price",                       "MCOILWTICO","monthly","log100"
 )
 
-# Combine all groups into one configuration
-var_config <- rbind(nipa, labour, financial, additional)
+var_config <- bind_rows(nipa, labour, financial, additional)
 
+## ── 4.  Data download & transform ──────────────────────────────────────────
+start_date <- 1986                 # inclusive
+end_date   <- 2025.00              # decimal year (2025Q4)
 
-
-# specify start/end in decimal year format
-start_date = 1986
-end_date   = 2025.00  # e.g. 2024q4
-
-# fetch data
 dfs <- fetch_data_from_fred(var_config, start_date, end_date)
-df        = dfs$df       # transformed data frame
-data      = dfs$data     # numeric matrix (for bvar)
-trans     = dfs$trans
-var_names = dfs$var_names
-var_names0= dfs$var_names0
+df          <- dfs$df          # transformed levels (tibble)
+data_mat    <- dfs$data        # numeric matrix (T × N)
+trans       <- dfs$trans
+var_names   <- dfs$var_names   # safe column names
+var_names0  <- dfs$var_names0  # original labels
 
-# create df_raw by reversing transforms for yoy constraints or just for clarity
-df_raw <- df
-for(j in seq_along(var_names)){
-  col_j <- var_names[j]
-  if(trans[j] == "log100"){
-    df_raw[[col_j]] <- exp(df_raw[[col_j]] / 100)
-  } else if(trans[j] == "raw"){
-    df_raw[[col_j]] <- df_raw[[col_j]] / 100
-  }
-  # special scaling for potential gdp
-  if(var_names0[j] == "Potential GDP"){
-    df_raw[[col_j]] <- df_raw[[col_j]] / 10
-  }
-}
+## Convenience: raw-level historical df (for YoY constraints)
+df_raw <- rebuild_raw_levels(df, trans, var_names0)
 
-#-----------------------------------
-# 2. bvar estimation
-#-----------------------------------
-p       = 4
-n_draw  = 2000L
-n_burn  = 1000L
-n_sim   = n_draw - n_burn  # we do not hard-code 1000 again
+## ── 5.  BVAR estimation ────────────────────────────────────────────────────
+p       <- 4        # lags
+n_draw  <- 2000L    # posterior draws
+n_burn  <- 1000L    # burn-in
+n_sim   <- n_draw - n_burn
 
-# we estimate up to row 184 => example for historical window
-data_est = data[1:nrow(data),]
+res <- estimate_bvar(
+  data_mat, p,
+  n_draw = n_draw, n_burn = n_burn,
+  verbose = TRUE,
+  use_soc = TRUE)        # SOC hyper-prior enabled
 
-res = estimate_bvar(
-  data     = data_est,
-  p        = 4,
-  n_draw   = 2000L,
-  n_burn   = 1000L,
-  verbose  = TRUE,
-  use_soc  = TRUE
-)
+## ── 6.  Unconditional forecast ─────────────────────────────────────────────
+h <- 41                           # quarters ahead
 
-#-----------------------------------
-# 3. unconditional forecast
-#-----------------------------------
-# generate an unconditional forecast with horizon h
-h = 41
-forecasts = list()
+forecasts          <- list()
+forecasts$base     <- generate_unconditional(
+  data_mat, df, res, p, h, n_sim, var_names0)
+uncond_fcst        <- forecasts$base
 
-forecasts[["base"]] = generate_unconditional(data, df, res, p, h, n_sim, var_names0)
+df_combined_raw <- combine_fcst_with_history_raw(
+  uncond_fcst, df, h,
+  trans, var_names, var_names0,
+  center = "median")
+write_csv(df_combined_raw, "unconditional_forecast.csv")
 
-# save that forecast to csv
-uncond_fcst = forecasts[["base"]]
-df_combined_raw = combine_fcst_with_history_raw(
-  fcst_array     = uncond_fcst,
-  df_transformed = df,
-  h              = h,
-  trans          = trans,
-  var_names      = var_names,
-  var_names0     = var_names0,
-  center         = "median"
-)
-write.csv(df_combined_raw, "unconditional_forecast.csv")
-# 
-# #-----------------------------------
-# # 4. flexible conditional forecast (example usage)
-# #-----------------------------------
+## ── 7.  Conditional forecasts – illustrative examples ----------------------
+h_cond <- 12   # shorter horizon for narrative scenarios
 
-h_cond <- 12  # horizon in quarters for the scenario
-# 
-# # (c) condition: fed funds + yoy gdp
-# cond_fed_gdp <- list(
-#   "Fed Funds Rate" = list(
-#     mode = "rate_raw",
-#     path = c(4.33, 4.08, 3.83, 3.58, 3.33, NA, NA, NA, NA, NA, NA, NA)
-#   ),
-#   "GDP" = list(
-#     mode = "yoy_log",
-#     path = c(2.22, 1.66, 1.1, 0.76, 1.01, 1.25, 1.6, 2, 2.06, 2.09, 2.01, 1.85)
-#   )
-# )
-# fcst_cond_fed_gdp <- conditional_flexible(
-#   data           = data,
-#   df             = df,
-#   df_history_raw = df_raw,
-#   res            = res,
-#   p              = 4,
-#   h              = h_cond,
-#   n_sim          = n_sim,
-#   var_names0     = var_names0,
-#   scenario_name  = "cond_fed_gdp",
-#   condition_specs= cond_fed_gdp,
-#   verbose        = TRUE
-# )
-# df_cond_fed_gdp <- combine_fcst_with_history_raw(
-#   fcst_array     = fcst_cond_fed_gdp,
-#   df_transformed = df,
-#   h              = h_cond,
-#   trans          = trans,
-#   var_names      = var_names,
-#   var_names0     = var_names0,
-#   center         = "median"
-# )
-# write.csv(df_cond_fed_gdp, "conditional_flex_fed_gdp.csv")
-# forecasts[["cond_fed_gdp"]] <- fcst_cond_fed_gdp
-
-# (d) march forecast 
+### Example A – GDP & CPI YoY path ------------------------------------------
 cond_gdp_cpi <- list(
-  "GDP" = list(
-    mode = "yoy_log",
-    path = c(-0.16, -1.2, -1.56, -0.92, 0.99, 1.77, 2.05, NA, NA, NA, NA, NA)
-  ),
-  "CPI-U" = list(
-    mode = "yoy_log",
-    path = c(NA, 4, 3.5,	NA, NA,	NA,	NA,	NA, NA, NA, NA, NA)
-  )
+  "GDP"   = list(mode = "yoy_log",
+                 path = c(-0.16, -1.20, -1.56, -0.92,
+                          0.99,  1.77,  2.05, rep(NA, 5))),
+  "CPI-U" = list(mode = "yoy_log",
+                 path = c(NA, 4.0, 3.5, rep(NA, 9)))
 )
 
-
-
-fcst_cond_gdp_cpi <- conditional_flexible(
-  data           = data,
+forecasts$cond_gdp_cpi <- conditional_flexible(
+  data           = data_mat,
   df             = df,
   df_history_raw = df_raw,
   res            = res,
-  p              = 4,
+  p              = p,
   h              = h_cond,
   n_sim          = n_sim,
   var_names0     = var_names0,
   scenario_name  = "cond_gdp_cpi",
   condition_specs= cond_gdp_cpi,
-  verbose        = TRUE
-)
+  verbose        = TRUE)
+
 df_cond_gdp_cpi <- combine_fcst_with_history_raw(
-  fcst_array     = fcst_cond_gdp_cpi,
-  df_transformed = df,
-  h              = h_cond,
-  trans          = trans,
-  var_names      = var_names,
-  var_names0     = var_names0,
-  center         = "median"
-)
-write.csv(df_cond_gdp_cpi, "conditional_flex_gdp_cpi.csv")
-forecasts[["cond_gdp_cpi"]] <- fcst_cond_gdp_cpi
+  forecasts$cond_gdp_cpi, df, h_cond,
+  trans, var_names, var_names0,
+  center = "median")
+write_csv(df_cond_gdp_cpi, "conditional_flex_gdp_cpi.csv")
 
-
-# (d) march forecast 
+### Example B – Fed funds path + CPI-U YoY -----------------------------------
 cond_fed_cpi <- list(
-  "Fed Funds Rate" = list(
-    mode = "rate_raw",
-    path = c(4.33, 3.83, 3.58, 3.33, NA, NA, NA, NA, NA, NA, NA, NA)
-  ),
-  "CPI-U" = list(
-    mode = "yoy_log",
-    path = c(NA,	4, 3.5,	NA, NA,	NA,	NA,	NA, NA, NA, NA, NA)
-  )
+  "Fed Funds Rate" = list(mode = "rate_raw",
+                          path = c(4.33, 3.83, 3.58, 3.33,
+                                   rep(NA, 8))),
+  "CPI-U"          = list(mode = "yoy_log",
+                          path = c(NA, 4.0, 3.5, rep(NA, 9)))
 )
 
-
-fcst_cond_fed_cpi <- conditional_flexible(
-  data           = data,
+forecasts$cond_fed_cpi <- conditional_flexible(
+  data           = data_mat,
   df             = df,
   df_history_raw = df_raw,
   res            = res,
-  p              = 4,
+  p              = p,
   h              = h_cond,
   n_sim          = n_sim,
   var_names0     = var_names0,
   scenario_name  = "cond_fed_cpi",
   condition_specs= cond_fed_cpi,
-  verbose        = TRUE
-)
+  verbose        = TRUE)
+
 df_cond_fed_cpi <- combine_fcst_with_history_raw(
-  fcst_array     = fcst_cond_fed_cpi,
-  df_transformed = df,
-  h              = h_cond,
-  trans          = trans,
-  var_names      = var_names,
-  var_names0     = var_names0,
-  center         = "median"
-)
-write.csv(df_cond_fed_cpi, "conditional_flex_fed_cpi.csv")
-forecasts[["cond_fed_cpi"]] <- fcst_cond_fed_cpi
+  forecasts$cond_fed_cpi, df, h_cond,
+  trans, var_names, var_names0,
+  center = "median")
+write_csv(df_cond_fed_cpi, "conditional_flex_fed_cpi.csv")
 
-#-----------------------------------
-# 5. adding shocks
-#-----------------------------------
-# we can shock certain variables after building a baseline
-# example: (a) shock core pce on unconditional, (b) shock 10y rate on fed funds scenario
-
-# (i) shock core pce 
+## ── 8.  Ex-post shock on baseline ------------------------------------------
 shock_list_corepce <- list(
-  "Core PCE Price Index" = list(
-    quarter_start = 2,
-    quarter_end   = 3,
-    shift         = 1  
-  )
+  "Core PCE Price Index" = list(quarter_start = 2,
+                                quarter_end   = 3,
+                                shift         = 1)   # +1 (log*100 units)
 )
-fcst_shock_corepce_uncond <- shock_after_baseline_partial_pin(
-  data           = data,
+
+forecasts$shock_corepce <- shock_after_baseline_partial_pin(
+  data           = data_mat,
   df             = df,
   df_history_raw = df_raw,
   res            = res,
-  p              = 4,
+  p              = p,
   h              = 12,
   n_sim          = n_sim,
   var_names0     = var_names0,
   scenario_name  = "shock_corepce_on_uncond",
-  baseline_specs = NULL,  
+  baseline_specs = NULL,         # start from unconditional
   shock_list     = shock_list_corepce,
-  verbose        = TRUE
-)
+  verbose        = TRUE)
+
 df_shock_corepce_uncond_raw <- combine_fcst_with_history_raw(
-  fcst_array     = fcst_shock_corepce_uncond,
-  df_transformed = df,
-  h              = 12,
-  trans          = trans,
-  var_names      = var_names,
-  var_names0     = var_names0,
-  center         = "median"
-)
-write.csv(df_shock_corepce_uncond_raw, "shock_corepce_on_uncond.csv")
-forecasts[["shock_corepce_on_uncond"]] <- fcst_shock_corepce_uncond
+  forecasts$shock_corepce, df, 12,
+  trans, var_names, var_names0,
+  center = "median")
+write_csv(df_shock_corepce_uncond_raw, "shock_corepce_on_uncond.csv")
 
-
-# (ii) shock core pce, EPU increase
-shock_list_corepce_infexp <- list(
-  "PCE Price Index" = list(
-    quarter_start = 2,
-    quarter_end   = 3,
-    shift         = 2  # +0.5 in log(*100) => about +0.5% level
-  ),
-  "Economic Policy Uncertainty Index" = list(
-    quarter_start = 1,
-    quarter_end   = 3,
-    shift         = 50  # +0.5 in log(*100) => about +0.5% level
-  )
-)
-fcst_shock_corepce_infexp_uncond <- shock_after_baseline_partial_pin(
-  data           = data,
-  df             = df,
-  df_history_raw = df_raw,
-  res            = res,
-  p              = 4,
-  h              = 12,
-  n_sim          = n_sim,
-  var_names0     = var_names0,
-  scenario_name  = "shock_corepce_infexp_on_uncond",
-  baseline_specs = NULL,  
-  shock_list     = shock_list_corepce_infexp,
-  verbose        = TRUE
-)
-df_shock_corepce_infexp_uncond_raw <- combine_fcst_with_history_raw(
-  fcst_array     = fcst_shock_corepce_infexp_uncond,
-  df_transformed = df,
-  h              = 12,
-  trans          = trans,
-  var_names      = var_names,
-  var_names0     = var_names0,
-  center         = "median"
-)
-write.csv(df_shock_corepce_infexp_uncond_raw, "shock_corepce_infexp_on_uncond.csv")
-forecasts[["shock_corepce_infexp_on_uncond"]] <- fcst_shock_corepce_infexp_uncond
-
-
-
-
-
-
-#-----------------------------------
-# 6. multi-scenario tile plot examples
-#-----------------------------------
-# here we compare yoy-based transformations for gdp or inflation,
-# and raw rates for e.g. unemployment, fed funds, 10y yield.
-
-
-# scenario_data_list <- list(
-#   "Unconditional" = df_combined_raw,
-#   "FedGDP" = df_cond_fed_gdp,
-#   "FedGDPCpi" = df_cond_fed_gdp_cpi
-# )
-
+## ── 9.  Quick visual outputs -----------------------------------------------
 scenario_data_list <- list(
-  "Unconditional" = df_combined_raw
+  "Unconditional"       = df_combined_raw,
+  "Cond GDP & CPI YoY"  = df_cond_gdp_cpi,
+  "Cond FedFunds & CPI" = df_cond_fed_cpi,
+  "Shock Core PCE"      = df_shock_corepce_uncond_raw
 )
 
 my_yoy_vars <- c("GDP", "PCE.Price.Index", "Core.PCE.Price.Index")
 my_raw_vars <- c("Unemployment.Rate", "TR10y.Rate", "Fed.Funds.Rate")
 
-# gather scenarios into long format
 df_long_all <- gather_scenarios_for_plot(
-  scenario_list = scenario_data_list,
-  df_original   = df,
-  yoy_vars      = my_yoy_vars,
-  raw_vars      = my_raw_vars
-)
+  scenario_data_list, df,
+  yoy_vars = my_yoy_vars,
+  raw_vars = my_raw_vars)
 
-# plot the multi-scenario tile
 p_all <- plot_key_vars_multi_scenarios(
   df_long_all,
-  main_title = "US unconditional Q2 forecast"
-)
-print(p_all)
+  main_title = "US BVAR – baseline, conditions & shocks")
 ggsave("comparison_scenarios.png", p_all, width = 15, height = 6)
 
-#-----------------------------------
-# 7. single-variable fan chart example
-#-----------------------------------
-# we create a fan chart for unemployment rate from a particular scenario
-
+## Fan chart for real GDP ----------------------------------------------------
 p_one_var <- make_fanchart_one_var_export(
-  fcst_array      = uncond_fcst,
-  df              = df,
+  uncond_fcst, df,
   var_of_interest = "GDP",
   var_names       = var_names,
   var_names0      = var_names0,
   trans           = trans,
-  start_plot      = 2015,          # earliest year to show
+  start_plot      = 2015,
   center          = "median",
-  impose_zero     = FALSE,
-  export_csv_name = "gdp_fcst_cond_fed_gdp.csv"
-)
-print(p_one_var)
+  export_csv_name = "gdp_unconditional_fanchart.csv")
 ggsave("gdp_fcst_cond_fed_gdp.pdf", p_one_var, width = 8, height = 5)
 
-
-#-----------------------------------
-# 8. structural impulse response example
-#-----------------------------------
-# compute an IRF to a Fed Funds Rate shock and plot responses
-
-irf_ffr <- generate_irf(
-  res       = res,
-  p         = p,
-  horizon   = 12,
-  shock_var = "Fed Funds Rate"
-)
-
-p_irf_ffr <- plot_irf_core(
-  irf_array  = irf_ffr,
-  var_names0 = var_names0,
-  shock_name = "Fed Funds Rate"
-)
-print(p_irf_ffr)
-ggsave("irf_fedfunds.png", p_irf_ffr, width = 10, height = 6)
-
-
+## End of script #############################################################
 
