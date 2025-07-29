@@ -12,9 +12,8 @@ A self‑contained workflow for constructing, estimating, and visualising a Baye
 | **Transform** | Apply CBO‑style transformations (`log*100` for real levels / prices, `×100` for interest‑rate & % variables).   |
 | **Estimate**  | Fit a Minnesota‑prior BVAR (with optional Slope‑Of‑Coefficients hyper‑prior) via the `BVAR` R package.          |
 | **Forecast**  | Produce unconditional paths; add conditional scenarios or ex‑post shocks via a state‑space / Kalman smoother.   |
-| **Output**    | Write tidy CSVs and publication‑grade plots (scenario tiles, fan charts).                                       |
+| **Output**    | Write CSVs and plots (scenario tiles, fan charts).                                       			  |
 
-The design philosophy is **transparent** (no hidden steps), **reproducible** (single `main.R` script) and **flexible** (easy to add/replace series or scenarios).
 
 ---
 
@@ -44,35 +43,10 @@ The key in the repository is a public/demo token; feel free to replace it.
 
 ---
 
-## 4 Variable mapping
+## 4 Running the model
 
-All price & quantity indices are **rebased to 2017 = 100** (FRED’s current convention).
-
-| Human label                   | Safe column            | FRED ID  | Freq. | Transform |
-| ----------------------------- | ---------------------- | -------- | ----- | --------- |
-| Real GDP                      | `GDP`                  | GDPC1    | Q     | log100    |
-| Real PCE                      | `Consumption`          | PCECC96  | Q     | log100    |
-| Real Private Fixed Investment | `Investment.nonres.`   | GPDIC1   | Q     | log100    |
-| Real Exports                  | `Exports`              | EXPGSC1  | Q     | log100    |
-| Real Imports                  | `Imports`              | IMPGSC1  | Q     | log100    |
-| GDP Deflator                  | `GDP.Deflator`         | GDPDEF   | Q     | log100    |
-| PCE Price Index               | `PCE.Price.Index`      | PCEPI    | Q     | log100    |
-| Core PCE Price Index          | `Core.PCE.Price.Index` | PCEPILFE | Q     | log100    |
-| CPI‑U                         | `CPI.U`                | CPIAUCSL | Q     | log100    |
-| Potential GDP                 | `Potential.GDP`        | GDPPOT   | Q     | log100    |
-| Federal Funds Rate            | `Fed.Funds.Rate`       | FEDFUNDS | M → Q | ×100      |
-| …                             | …                      | …        | …     | …         |
-
-> **Transform codes**  `log100` = `log(x) * 100`;   `×100` = levels or rates multiplied by 100 so that “1 percent” is stored as `100`.
-
-The full mapping is in `main.R`; edit or extend it there.
-
----
-
-## 5 Running the model
-
-1. Clone the repo and `cd` into it.
-2. Open `main.R` in R Studio (or your favourite IDE).
+1. Clone the repo 
+2. Open `main.R` in R Studio.
 3. Adjust `start_date`, `end_date`, or `var_config` if required.
 4. `Source` the script – it will:
 
@@ -122,10 +96,7 @@ shock_list <- list(
 | `comparison_scenarios.png`              | Six‑panel tile plot comparing baseline vs scenarios. |
 | `gdp_unconditional_fanchart.csv / .pdf` | 66/90 % fan chart for real GDP.                      |
 
-All CSVs follow a tidy, wide format with a `yq` column (`zoo::yearqtr`).
 
 ---
 
-## 9 Licence
 
-The code is released under the MIT Licence; FRED data are public domain.
